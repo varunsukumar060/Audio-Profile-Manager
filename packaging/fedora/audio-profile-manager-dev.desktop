@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Audio Profile Manager (Development)
+Comment=Manage and route audio across multiple output devices
+Exec=audio-profile-manager-dev
+Icon=audio-speakers-symbolic
+Terminal=false
+Categories=AudioVideo;
+StartupNotify=true
+StartupWMClass=io.github.pipewire_multi_output.dev

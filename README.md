@@ -300,3 +300,25 @@ pw-cli ls Node                  # List all PipeWire nodes
 ## License
 
 [MIT](LICENSE)
+
+## Development tests
+
+The profile persistence regression tests use Python's standard library and temporary directories. They do not start audio routing or call `pactl`/systemd:
+
+```bash
+PYTHONPATH=. python3 -m unittest discover -s tests -v
+```
+
+## Portable profile import/export
+
+The development GUI offers **Import Profile…** and **Export Profile…**. Export writes a versioned JSON file containing the saved profile settings, not runtime state. Import validates the selected JSON and creates a new profile rather than overwriting an existing profile. Legacy profile JSON is also accepted. Imported profiles are saved only; users must choose **Apply Profile** when ready to route audio.
+
+Run the core regression tests with:
+
+```bash
+PYTHONPATH=. python3 -m unittest discover -s tests -v
+```
+
+## Release notes
+
+- [v0.3 changelog](CHANGELOG-v0.3.md)

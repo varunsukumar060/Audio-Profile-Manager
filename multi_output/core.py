@@ -18,13 +18,16 @@ import signal
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-CONFIG_DIR = Path.home() / ".config" / "pipewire-multi-output"
+# Isolated state for the Audio Profile Manager development build.
+# Do not share profiles or runtime state with the original installation.
+CONFIG_DIR = Path.home() / ".config" / "audio-profile-manager-dev"
 PROFILES_DIR = CONFIG_DIR / "profiles"
-STATE_DIR = Path.home() / ".cache" / "pipewire-multi-output"
+STATE_DIR = Path.home() / ".cache" / "audio-profile-manager-dev"
 
 # Legacy paths (pre-profile era)
 LEGACY_CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -38,6 +41,41 @@ LEGACY_SERVICE_NAME = "multi-output.service"
 MAX_SLUG_LENGTH = 32
 
 
+def _validate_slug(slug: str) -> str:
+    """Return a safe profile slug or raise ValueError.
+
+    Slugs are used in filenames, PipeWire node names, and systemd unit names,
+    so accepting path separators or arbitrary user input here is unsafe.
+    """
+    if not isinstance(slug, str) or not re.fullmatch(r"[a-z0-9_]{1,32}", slug):
+        raise ValueError("Profile ID must contain only lowercase letters, numbers, and underscores (max 32 characters).")
+    return slug
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """Atomically replace a JSON file to avoid half-written profile/state files."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as handle:
+            temp_name = handle.name
+            json.dump(data, handle, indent=2, ensure_ascii=False, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+        temp_name = None
+    finally:
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+
+
 def slugify(name: str) -> str:
     """Convert a human-readable name into a filesystem-safe slug."""
     slug = re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_')
@@ -49,12 +87,33 @@ def null_sink_name(slug: str) -> str:
     return f"multi_out_{slug}"
 
 
+def _normalise_volume_percent(value: float) -> int:
+    """Validate a mixer value and return an integer percentage (0-150)."""
+    volume = float(value)
+    if not math.isfinite(volume) or not 0 <= volume <= 150:
+        raise ValueError("Volume must be between 0 and 150 percent.")
+    return int(round(volume))
+
+
+def set_master_volume(slug: str, volume_percent: float) -> None:
+    """Set a profile's virtual-sink volume, leaving hardware sink volumes alone."""
+    volume = _normalise_volume_percent(volume_percent)
+    result = subprocess.run(
+        ["pactl", "set-sink-volume", null_sink_name(slug), f"{volume}%"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown pactl error"
+        raise RuntimeError(f"Could not set master volume: {detail}")
+
+
 def _config_path(slug: str) -> Path:
-    return PROFILES_DIR / f"{slug}.json"
+    return PROFILES_DIR / f"{_validate_slug(slug)}.json"
 
 
 def _state_path(slug: str) -> Path:
-    return STATE_DIR / f"{slug}.json"
+    return STATE_DIR / f"{_validate_slug(slug)}.json"
 
 
 @dataclass
@@ -64,6 +123,7 @@ class SpeakerConfig:
     sink_name: str  # PipeWire sink name (or prefix for fuzzy match)
     delay_ms: float = 0  # per-speaker delay in ms (0 = reference speaker)
     label: str = ""  # human-readable label (auto-populated from pactl)
+    volume_percent: float = 100.0  # volume for this routed output, 0-150
 
 
 @dataclass
@@ -73,6 +133,7 @@ class MultiOutputConfig:
     slug: str = "default"
     name: str = "Speakers/Soundbar"  # device description shown in sound settings
     speakers: list[SpeakerConfig] = field(default_factory=list)
+    master_volume_percent: float = 100.0  # profile-wide volume, 0-150
 
 
 @dataclass
@@ -286,6 +347,8 @@ def list_running_profiles() -> list[str]:
 
 def delete_profile(slug: str) -> None:
     """Remove a profile's config file."""
+    if slug == "default":
+        raise ValueError("The default profile is protected and cannot be deleted.")
     path = _config_path(slug)
     if path.exists():
         path.unlink()
@@ -306,44 +369,352 @@ def _unique_slug(desired: str) -> str:
 # --- Config persistence ---
 
 
+def _validate_config(config: MultiOutputConfig) -> None:
+    """Validate saved profile data before it reaches disk or the audio engine."""
+    _validate_slug(config.slug)
+    if not isinstance(config.name, str) or not config.name.strip():
+        raise ValueError("Profile name cannot be empty.")
+    if not isinstance(config.speakers, list):
+        raise ValueError("Profile speakers must be a list.")
+    _normalise_volume_percent(config.master_volume_percent)
+    for index, speaker in enumerate(config.speakers, start=1):
+        if not isinstance(speaker.sink_name, str) or not speaker.sink_name.strip():
+            raise ValueError(f"Output {index} must have a sink name.")
+        try:
+            delay = float(speaker.delay_ms)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Output {index} has an invalid delay.") from exc
+        if not math.isfinite(delay) or delay < 0:
+            raise ValueError(f"Output {index} delay must be a finite non-negative number.")
+        _normalise_volume_percent(speaker.volume_percent)
+
+
 def save_config(config: MultiOutputConfig) -> None:
-    """Save configuration to its profile file."""
-    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    """Validate and atomically save configuration for a profile."""
+    _validate_config(config)
     data = {
         "slug": config.slug,
         "name": config.name,
         "speakers": [asdict(s) for s in config.speakers],
+        "master_volume_percent": config.master_volume_percent,
     }
-    _config_path(config.slug).write_text(json.dumps(data, indent=2) + "\n")
+    _atomic_write_json(_config_path(config.slug), data)
 
 
 def load_config(slug: str = "default") -> MultiOutputConfig | None:
-    """Load configuration for a profile slug."""
+    """Load and validate configuration for a profile slug.
+
+    Returns None for a missing, malformed, or invalid profile rather than
+    passing unsafe values to the GUI or audio engine.
+    """
     try:
-        data = json.loads(_config_path(slug).read_text())
-        speakers = [SpeakerConfig(**s) for s in data.get("speakers", [])]
-        return MultiOutputConfig(
-            slug=data.get("slug", slug),
+        requested_slug = _validate_slug(slug)
+        data = json.loads(_config_path(requested_slug).read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        raw_speakers = data.get("speakers", [])
+        if not isinstance(raw_speakers, list):
+            return None
+        speakers = [SpeakerConfig(**speaker) for speaker in raw_speakers]
+        config = MultiOutputConfig(
+            slug=requested_slug,
             name=data.get("name", "Speakers/Soundbar"),
             speakers=speakers,
+            master_volume_percent=float(data.get("master_volume_percent", 100.0)),
         )
-    except (FileNotFoundError, json.JSONDecodeError, TypeError):
+        _validate_config(config)
+        return config
+    except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError, OverflowError):
         return None
+
+
+PROFILE_EXPORT_FORMAT = "audio-profile-manager-profile"
+PROFILE_EXPORT_VERSION = 1
+MAX_PROFILE_IMPORT_BYTES = 1_000_000
+
+
+def export_profile(config: MultiOutputConfig, destination: str | Path) -> Path:
+    """Export one validated profile as portable JSON, without runtime state."""
+    _validate_config(config)
+    path = Path(destination).expanduser()
+    if not path.name:
+        raise ValueError("Choose a filename for the exported profile.")
+    payload = {
+        "format": PROFILE_EXPORT_FORMAT,
+        "format_version": PROFILE_EXPORT_VERSION,
+        "profile": {
+            "name": config.name,
+            "speakers": [asdict(speaker) for speaker in config.speakers],
+            "master_volume_percent": config.master_volume_percent,
+        },
+    }
+    _atomic_write_json(path, payload)
+    return path
+
+
+def import_profile(source: str | Path) -> MultiOutputConfig:
+    """Validate and import a profile as a new, uniquely named saved profile.
+
+    The imported slug is intentionally not trusted or reused. Import never
+    replaces an existing profile and never imports runtime process state.
+    Both this app's portable export format and legacy profile JSON are accepted.
+    """
+    path = Path(source).expanduser()
+    try:
+        if path.stat().st_size > MAX_PROFILE_IMPORT_BYTES:
+            raise ValueError("Profile file is too large (maximum 1 MB).")
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("The selected file is not valid JSON.") from exc
+    except UnicodeDecodeError as exc:
+        raise ValueError("The selected file is not valid UTF-8 JSON.") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError("The selected file must contain a JSON object.")
+
+    if "format" in data:
+        if data.get("format") != PROFILE_EXPORT_FORMAT:
+            raise ValueError("This file is not an Audio Profile Manager profile export.")
+        if data.get("format_version") != PROFILE_EXPORT_VERSION:
+            raise ValueError("This profile export uses an unsupported format version.")
+        raw_profile = data.get("profile")
+    else:
+        # Compatibility with profile JSON files created before portable exports.
+        raw_profile = data
+
+    if not isinstance(raw_profile, dict):
+        raise ValueError("Profile data is missing or invalid.")
+
+    name = raw_profile.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("The imported profile must have a non-empty name.")
+
+    raw_speakers = raw_profile.get("speakers", [])
+    if not isinstance(raw_speakers, list):
+        raise ValueError("The profile's outputs must be a JSON list.")
+    try:
+        speakers = [SpeakerConfig(**speaker) for speaker in raw_speakers]
+        master_volume = float(raw_profile.get("master_volume_percent", 100.0))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"The profile contains invalid output or volume data: {exc}") from exc
+
+    # Recompute the slug locally so imported data can never overwrite a profile.
+    slug = _unique_slug(name)
+    config = MultiOutputConfig(
+        slug=slug,
+        name=name.strip(),
+        speakers=speakers,
+        master_volume_percent=master_volume,
+    )
+    _validate_config(config)
+    save_config(config)
+    return config
+
+
+# --- Full profile backup and restore ---
+
+PROFILE_BACKUP_FORMAT = "audio-profile-manager-backup"
+PROFILE_BACKUP_VERSION = 1
+MAX_PROFILE_BACKUP_BYTES = 10_000_000
+MAX_BACKUP_PROFILES = 500
+
+
+def export_profiles_backup(destination: str | Path) -> Path:
+    """Export every valid saved profile, excluding runtime state."""
+    profiles = []
+    slugs = list_profiles()
+
+    if len(slugs) > MAX_BACKUP_PROFILES:
+        raise ValueError("Too many profiles to back up safely.")
+
+    for slug in slugs:
+        config = load_config(slug)
+        if config is None:
+            raise ValueError(
+                f"Cannot back up profile '{slug}': its saved configuration is invalid."
+            )
+        _validate_config(config)
+        profiles.append({
+            "slug": config.slug,
+            "name": config.name,
+            "speakers": [asdict(speaker) for speaker in config.speakers],
+            "master_volume_percent": config.master_volume_percent,
+        })
+
+    path = Path(destination).expanduser()
+    if not path.name:
+        raise ValueError("Choose a filename for the backup.")
+
+    payload = {
+        "format": PROFILE_BACKUP_FORMAT,
+        "format_version": PROFILE_BACKUP_VERSION,
+        "manifest": {
+            "profile_count": len(profiles),
+            "created_utc": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+            ),
+        },
+        "profiles": profiles,
+    }
+    _atomic_write_json(path, payload)
+    return path
+
+
+def _read_profiles_backup(source: str | Path) -> list[MultiOutputConfig]:
+    """Read and fully validate a backup before any profile files are changed."""
+    path = Path(source).expanduser()
+    try:
+        if path.stat().st_size > MAX_PROFILE_BACKUP_BYTES:
+            raise ValueError("Backup is too large (maximum 10 MB).")
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("The selected backup is not valid JSON.") from exc
+    except UnicodeDecodeError as exc:
+        raise ValueError("The selected backup is not valid UTF-8 JSON.") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError("The backup must contain a JSON object.")
+    if data.get("format") != PROFILE_BACKUP_FORMAT:
+        raise ValueError("This is not an Audio Profile Manager full backup.")
+    if data.get("format_version") != PROFILE_BACKUP_VERSION:
+        raise ValueError("This backup uses an unsupported format version.")
+
+    manifest = data.get("manifest")
+    raw_profiles = data.get("profiles")
+    if not isinstance(manifest, dict) or not isinstance(raw_profiles, list):
+        raise ValueError("The backup manifest or profile list is missing or invalid.")
+    if len(raw_profiles) > MAX_BACKUP_PROFILES:
+        raise ValueError("The backup contains too many profiles.")
+    if manifest.get("profile_count") != len(raw_profiles):
+        raise ValueError("The backup manifest profile count does not match its contents.")
+
+    configs = []
+    seen_slugs = set()
+
+    for index, raw in enumerate(raw_profiles, start=1):
+        if not isinstance(raw, dict):
+            raise ValueError(f"Backup profile {index} must be a JSON object.")
+
+        slug = _validate_slug(raw.get("slug"))
+        if slug in seen_slugs:
+            raise ValueError(f"The backup contains duplicate profile ID '{slug}'.")
+        seen_slugs.add(slug)
+
+        name = raw.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"Backup profile {index} has an invalid name.")
+
+        raw_speakers = raw.get("speakers")
+        if not isinstance(raw_speakers, list):
+            raise ValueError(f"Profile '{slug}' has an invalid outputs list.")
+
+        try:
+            speakers = [SpeakerConfig(**speaker) for speaker in raw_speakers]
+            master_volume = float(raw.get("master_volume_percent", 100.0))
+            config = MultiOutputConfig(
+                slug=slug,
+                name=name.strip(),
+                speakers=speakers,
+                master_volume_percent=master_volume,
+            )
+            _validate_config(config)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"Backup profile '{slug}' contains invalid configuration: {exc}"
+            ) from exc
+
+        configs.append(config)
+
+    return configs
+
+
+def _unique_restore_slug(desired: str, reserved: set[str]) -> str:
+    """Choose an available safe ID without replacing an existing profile."""
+    base = _validate_slug(desired)
+    if base not in reserved and not _config_path(base).exists():
+        return base
+
+    for number in range(2, 10000):
+        suffix = f"_{number}"
+        candidate = f"{base[:MAX_SLUG_LENGTH - len(suffix)]}{suffix}"
+        if candidate not in reserved and not _config_path(candidate).exists():
+            return candidate
+
+    raise ValueError(f"Could not find an available profile ID for '{desired}'.")
+
+
+def restore_profiles_backup(source: str | Path) -> tuple[list[MultiOutputConfig], Path | None]:
+    """Restore profiles without overwriting existing files or starting routing.
+
+    All backup data is validated before any writes. If profiles already exist,
+    a separate recovery backup is created first. Existing profile IDs are
+    preserved where available; collisions receive a new safe ID.
+    """
+    configs = _read_profiles_backup(source)
+
+    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    existing_slugs = set(list_profiles())
+    reserved = set(existing_slugs)
+    planned = []
+
+    for config in configs:
+        new_slug = _unique_restore_slug(config.slug, reserved)
+        reserved.add(new_slug)
+        planned.append(MultiOutputConfig(
+            slug=new_slug,
+            name=config.name,
+            speakers=config.speakers,
+            master_volume_percent=config.master_volume_percent,
+        ))
+
+    recovery_path = None
+    if existing_slugs:
+        recovery_dir = PROFILES_DIR.parent / "recovery-backups"
+        recovery_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        recovery_path = recovery_dir / f"pre-restore-{stamp}.json"
+        counter = 2
+        while recovery_path.exists():
+            recovery_path = recovery_dir / f"pre-restore-{stamp}-{counter}.json"
+            counter += 1
+        export_profiles_backup(recovery_path)
+
+    created_paths = []
+    try:
+        for config in planned:
+            destination = _config_path(config.slug)
+            if destination.exists():
+                raise ValueError(
+                    f"Profile '{config.slug}' appeared during restore; no overwrite attempted."
+                )
+            save_config(config)
+            created_paths.append(destination)
+    except Exception:
+        # Remove only files created by this restore attempt. Existing files
+        # are never replaced or removed.
+        for created_path in reversed(created_paths):
+            try:
+                created_path.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+
+    return planned, recovery_path
 
 
 # --- Runtime state ---
 
 
 def save_state(state: MultiOutputState) -> None:
-    """Save runtime state for a profile."""
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    """Atomically save runtime state for a profile."""
+    _validate_slug(state.slug)
     data = {
         "slug": state.slug,
         "null_node_id": state.null_node_id,
         "monitor_source_id": state.monitor_source_id,
         "speakers": [asdict(s) for s in state.speakers],
     }
-    _state_path(state.slug).write_text(json.dumps(data, indent=2) + "\n")
+    _atomic_write_json(_state_path(state.slug), data)
 
 
 def load_state(slug: str = "default") -> MultiOutputState | None:
@@ -411,7 +782,7 @@ def _launch_loopback(
         "-i",
         "node.dont-reconnect=true",
         "-o",
-        "node.dont-reconnect=true node.dont-monitor=true",
+        f"node.name=apm_route_{slug}_{index} node.dont-reconnect=true node.dont-monitor=true",
     ]
     if delay_ms > 0:
         cmd.extend(["--delay", str(delay_ms / 1000.0)])
@@ -421,6 +792,56 @@ def _launch_loopback(
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+
+def _find_route_sink_input_index(slug: str, index: int) -> int | None:
+    """Find the PulseAudio-compatible sink-input for one named loopback route."""
+    target_name = f"apm_route_{slug}_{index}"
+    result = subprocess.run(
+        ["pactl", "-f", "json", "list", "sink-inputs"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        return None
+    try:
+        entries = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        props = entry.get("properties") or {}
+        if props.get("node.name") == target_name:
+            try:
+                return int(entry["index"])
+            except (KeyError, TypeError, ValueError):
+                return None
+    return None
+
+
+def set_speaker_volume(slug: str, index: int, volume_percent: float) -> None:
+    """Set volume on one profile loopback stream, not on the physical sink."""
+    volume = _normalise_volume_percent(volume_percent)
+    input_index = None
+    for _ in range(15):
+        input_index = _find_route_sink_input_index(slug, index)
+        if input_index is not None:
+            break
+        time.sleep(0.1)
+    if input_index is None:
+        raise RuntimeError(
+            f"Could not find the playback stream for output {index + 1}. "
+            "The profile may not be running yet."
+        )
+    result = subprocess.run(
+        ["pactl", "set-sink-input-volume", str(input_index), f"{volume}%"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown pactl error"
+        raise RuntimeError(f"Could not set output volume: {detail}")
 
 
 def _check_speaker_conflicts(config: MultiOutputConfig) -> None:
@@ -540,6 +961,22 @@ def start(config: MultiOutputConfig, wait: bool = False, timeout: int = 300) -> 
         speakers=speaker_states,
     )
     save_state(state)
+
+    # Apply saved levels after the route streams have been created. Volume
+    # failures should not tear down otherwise-working audio routing.
+    try:
+        set_master_volume(slug, config.master_volume_percent)
+    except Exception as exc:
+        print(f"Warning: could not apply saved master volume: {exc}", file=sys.stderr)
+    for i, speaker in enumerate(config.speakers):
+        if abs(float(speaker.volume_percent) - 100.0) > 0.01:
+            try:
+                set_speaker_volume(slug, i, speaker.volume_percent)
+            except Exception as exc:
+                print(
+                    f"Warning: could not apply saved volume for output {i + 1}: {exc}",
+                    file=sys.stderr,
+                )
     return state
 
 

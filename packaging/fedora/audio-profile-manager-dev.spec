@@ -3,7 +3,7 @@ Version:        0.5.0
 Release:        2%{?dist}
 Summary:        Multi-output audio routing profile manager
 License:        MIT
-URL:            https://github.com/jeremyoverman/pipewire-multi-output
+URL:            https://github.com/varunsukumar060/Audio-Profile-Manager
 Source0:        %{name}-%{version}.tar.gz
 BuildArch:      noarch
 

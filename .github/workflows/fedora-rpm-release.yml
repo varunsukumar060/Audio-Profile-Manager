@@ -1,0 +1,68 @@
+name: Fedora RPM release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build RPM and publish release
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:44
+
+    steps:
+      - name: Install Fedora build prerequisites
+        run: |
+          dnf install -y git tar rpm-build rpmdevtools python3 python3-devel desktop-file-utils
+
+      - name: Check out tagged source
+        uses: actions/checkout@v7
+
+      - name: Build and validate Fedora RPM
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+            echo "Expected a version tag such as v0.5.0." >&2
+            exit 2
+          fi
+
+          VERSION="$VERSION" ./packaging/fedora/build-fedora-rpm.sh
+
+          RPM_PATH="$(find "$HOME/rpmbuild/RPMS" -type f \
+            -name "audio-profile-manager-dev-${VERSION}-*.noarch.rpm" -print -quit)"
+          if [[ -z "$RPM_PATH" ]]; then
+            echo "RPM build succeeded but the expected package was not found." >&2
+            find "$HOME/rpmbuild/RPMS" -type f -print || true
+            exit 1
+          fi
+
+          mkdir -p dist
+          cp "$RPM_PATH" dist/
+          (cd dist && sha256sum *.rpm > SHA256SUMS)
+          echo "Built package: $RPM_PATH"
+          cat dist/SHA256SUMS
+
+      - name: Verify release notes
+        run: |
+          NOTES_PATH="releases/${GITHUB_REF_NAME}.md"
+          if [[ ! -f "$NOTES_PATH" ]]; then
+            echo "Missing release notes: $NOTES_PATH" >&2
+            exit 1
+          fi
+
+      - name: Create GitHub Release and upload RPM
+        uses: softprops/action-gh-release@v3
+        with:
+          name: Audio Profile Manager ${{ github.ref_name }}
+          body_path: releases/${{ github.ref_name }}.md
+          files: |
+            dist/*.rpm
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
